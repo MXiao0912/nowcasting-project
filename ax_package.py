@@ -129,7 +129,7 @@ def ax_forecast(df, lag, Tin, C_dict, d_dict):
         Ui = Ci.T[:u,:] # unknown part of constraint Ci
         if len(Ci)>1: # len(Ci) > 1 ensures that d_dict[i]list(inds) works
             _, inds = sy.Matrix(Ui).rref()
-            if Ui.shape[1] > Ui.shape[0]: print('system overidentified, ax chooses only linearly independent rows')
+            if Ui.shape[1] > Ui.shape[0]: print('system overidentified, ax chooses only linearly independent rows') # This needs to be checked differently
             C_dict[i] = Ci[inds,:]
             d_dict[i] = d_dict[i][list(inds)]
             
