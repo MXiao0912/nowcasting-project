@@ -1,0 +1,448 @@
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(timetk)
+library(tidyverse)
+library(caret)
+library(glue)
+library(Smisc)
+library(CovTools)
+library(tictoc)
+library(doParallel)
+library(matlib)
+library(ggplot2)
+library(reshape2)
+```
+
+
+```{r Main Function}
+
+ax_forecast = function(df, lag, Tin, C_dict, d_dict, num_core=4){
+    
+    # Parameters
+    # ----------
+    # df: dataframe
+    #     (T+h) x m dataframe representing input data
+    #     the first m-k columns of T:T+h rows are nan, and the rest are not nan
+    #     if the columns are not sorted in this order, a sorted version df0 will be produced
+    # lag: int
+    #     the number of lags used as regressors in the step1 training
+    #     if all variables are unknown, lag should be > 0
+    # Tin: int
+    #     the number of time periods in historical data used to estimate forecast-error
+    # C_dict: dictionary
+    #     T+h length dictionary, each element of which is
+    #     (m-n) x m numpy matrix C of floag type in the constraint C x df = d
+    #     the order of columns must be the same of the columns of df
+    #     n is the number of free variables (net contents)
+    # d_dict: dictionary
+    #     T+h length dictionary of numpy array, each element of which is
+    #     (m-n) x 1 column vector in the constraint C x df = d
+    #    
+    # Returns
+    # -------
+    # df2: dataframe
+    #     (T+h) x m dataframe with nan values filled using the two-step forecasting method
+    # df1: dataframe
+    #     (T+h) x m dataframe with nan values filled using the first step of the forecasting method
+    # 
+    # Example
+    # -------
+    #
+    # T = 30
+    # h = 3
+    # num_free_vars = 5
+    # df_true = as.data.frame(matrix(rnorm((T+h)*num_free_vars),nrow = T+h))
+    # df_true['one'] = 1 # constant
+    # df_true['sum'] = rowSums(df_true)
+    # 
+    # # constraint in true data
+    # df_true['sum']-rowSums(df_true[,1:(ncol(df_true)-1)])
+    # 
+    # num_variables = num_free_vars + 2
+    # 
+    # df = df_true
+    # df[(nrow(df)-h+1):nrow(df),1] = NA
+    # df[(nrow(df)-h+1):nrow(df),2] = NA
+    # df[(nrow(df)-h+1):nrow(df),'one'] = NA
+    # 
+    # C = rep(1,num_variables)
+    # C[length(C)] = -1
+    # C = matrix(C, ncol = num_variables)
+    # d = 0
+    # C_dict = list()
+    # d_dict = list()
+    # for (i in 1:(T+h)){
+    # 
+    #     C_dict[[i]] = C
+    #     d_dict[[i]] = d
+    # }
+    # 
+    # lag = 1
+    # Tin = 5
+    # df
+    # #
+    # tic()
+    # res = ax_forecast(df, lag, Tin, C_dict, d_dict)
+    # df2 = res$df2
+    # df1 = res$df1
+    # dfaug_model = res$dfaug_model
+    # toc()
+    #
+    # #
+    # # # forecast of the variable '0'
+    # result = data.frame('index' = 1:nrow(df_true),'true' = df_true[,1],
+    #                     'first_stage' = df1[,1],
+    #                     'second_stage' = df2[,1])
+    # result = melt(result, id.var = 'index',variable.name = 'series')
+    # ggplot(result, aes(index,value)) + geom_line(aes(colour = series))
+
+    # # the constraints are satisfied up to numerical error
+    # sum(abs(df2[,'sum']-rowSums(df2[,1:(ncol(df2)-1)])))
+  
+# check1: make sure df elements are numeric
+  df <- apply(df, 2, as.numeric)
+
+# check2: make sure df is dataframe
+  df = as.data.frame(df)
+  
+# check3: make sure there are something to forecast
+  if (anyNA(df) == FALSE){
+    stop('Nothing to forecast. Extend time for some variables.')
+  }
+  
+# check4: check whether unknown variables come before known variables, if not, change the columns of C in C_dict
+  u_col = colnames(df)[apply(df, 2, anyNA)]
+  k_col = colnames(df)[!apply(df, 2, anyNA)]
+  correct_order = c(u_col, k_col)
+  if (sum(correct_order != colnames(df))){
+    df0 = df[,correct_order]
+    for (i in 1:length(C_dict)){
+      C_dict[[i]] = data.frame(C_dict[[i]])
+      colnames(C_dict[[i]]) = colnames(df)
+      C_dict[[i]] = C_dict[[i]][correct_order]
+      print('df and C are re-ordered')
+    }
+  } else{
+    df0 = df
+  }
+    
+# check5: Check rank condition of the constraint matrices and drop redundant constraints
+  u = sum(apply(df, 2, anyNA))
+  for (i in 1:length(C_dict)){
+      Ci = C_dict[[i]]
+      Ui = matrix(t(Ci)[1:u,],nrow = u)
+      if (nrow(Ci)>1){
+          inds = findDepMat(Ui,rows = FALSE)
+          if (sum(inds) != 0){
+            print('system overidentified, ax chooses only linearly independent rows')
+            C_dict[[i]] = Ci[!inds,]
+            d_dict[[i]] = d_dict[[i]][!inds]
+          }
+      }
+      Ci = C_dict[[i]]
+      Ui = matrix(t(Ci)[1:u,],nrow = u)
+      if (ncol(Ui) == nrow(Ui)){
+        stop('Error: system exactly identified, no need to use ax')
+      }
+  }
+
+# 1st step forecast    
+    step1_res = step1(df0, lag, Tin, num_core)
+    df1 = step1_res$df1
+
+# 2nd step reconciliation    
+    df2 = step2(df1, df0, Tin, C_dict, d_dict)
+    
+# put back the variables in the original order
+    df1 = df1[,colnames(df)]
+    df2 = df2[,colnames(df)]
+      
+    return (list("df2"=df2, "df1" = df1, "dfaug_model" = step1_res$dfaug_model))    
+}
+
+```
+
+```{r supplementary functions}
+my_inv = function(X){
+  if (nrow(X)==1 & ncol(X)==1){
+    Y = 1/X
+  } else{
+    Y = inv(X)
+  }
+  return(Y)
+}
+normalize_x = function(X_data, X_pred){
+    
+    X_mean = colMeans(X_data, na.rm = TRUE)
+    X_std  = apply(X_data, 2, sd, na.rm = TRUE)
+    X_std[X_std == 0] = 1 # if std is 0, division creates error, so replace it by 1
+    X_data  = sweep(sweep(X_data, 2, X_mean), 2, X_std, FUN = "/")
+    X_pred = (X_pred-X_mean)/X_std
+    
+    return(list("X_data" = X_data, "X_pred" = X_pred, "X_std" = X_std, "X_mean" = X_mean)) 
+}
+
+normalize_y = function(y_data){
+    
+    y_mean = mean(y_data, na.rm = TRUE)
+    y_std  = sd(y_data, na.rm = TRUE) 
+    y_std = ifelse(y_std == 0, 1, y_std)
+    y_data = (y_data - y_mean)/y_std
+    
+    return(list("y_data" = y_data, "y_std" = y_std, "y_mean" = y_mean)) 
+}
+
+augment_lag = function(df, lag){
+    # augment_lag adds lags of df
+    # 
+    # Parameters
+    #  ----------
+    #  df: dataframe
+    #  lag: int
+    #      the number of lags used as regressors in the step1 training
+    # 
+    # Returns
+    #  -------
+    #  dfaug: dataframe
+    #      If df is n x m, dfaug is (n-lag) x (m x lag)
+    dfaug = df %>% tk_augment_lags(everything(), .lags = 1:lag)
+    dfaug = dfaug[(lag+1):nrow(dfaug),]
+    dfaug = as.data.frame(dfaug)
+    
+    return(dfaug)
+}
+
+step1 = function(df, lag, Tin, num_core){
+  
+    #  Parameters
+    #  ----------
+    #  df0: dataframe
+    #      (T+h) x m dataframe representing input data
+    #      the first m-k columns of T:T+h rows are nan, and the rest are not nan
+    #  lag: int
+    #      the number of lags used as regressors in the step1 training
+    #  Tin: int
+    #      the number of time periods in historical data used to estimate forecast-error
+    #  
+    # Returns
+    #  -------
+    #  df1: dataframe
+    #      (T+h) x m dataframe
+    #      the last Tin+h rows of the unknown variables are forecasts
+    #      the last h rows of the known variables are filled with the forecasts of the unknowns
+    #  df0aug_fitted_model: dictionary
+    #      u + 2 length of dictionary.
+    #      Key 'regularization' contains fit object from ElasticNetCV
+    #      Key 'dim_reduction' contains fit object from OLS+PCA
+    #      If a key is a variable name in df0, it contains the fit object that
+    #      minimizes absolute forecast error between ElasticNetCV and OLS+PCA
+    
+    registerDoParallel(cores = num_core)
+    
+    # Preparation for step1 forecast 
+    # Augment lags
+    dfaug = augment_lag(df,lag)
+    
+    # extract information on T,h,u,k from the shape of df
+    T_aug = nrow(na.omit(dfaug))
+    h = nrow(dfaug) - T_aug
+    m_aug = ncol(dfaug)
+    k_aug = sum(apply(dfaug[1:(T_aug+1),],2,function(x){!any(is.na(x))}))
+    u = m_aug - k_aug
+    
+    # create sub-dataframes
+    dfaug_u = dfaug[,1:u]
+    dfaug_k = dfaug[,(u+1):ncol(dfaug)]
+
+    #Step1 Prediction for T+1
+    dfaug_h = dfaug
+    dfaug_h_regularization = dfaug
+    dfaug_h_dim_reduction = dfaug
+    dfaug_model = list()
+    dfaug_regularization = vector("list", nrow(dfaug))
+    for (l in 1:nrow(dfaug)){
+      list_ind = vector("list", ncol(dfaug))
+      names(list_ind) = colnames(dfaug)
+      dfaug_regularization[[l]] = list_ind
+    }
+    dfaug_dim_reduction = dfaug_regularization   
+    
+    for (t in (T_aug-Tin+1):(T_aug+1)){
+        
+      X_data = dfaug_k[1:(t-1),]
+      X_pred = dfaug_k[t,]   
+        
+      res = normalize_x(X_data, X_pred) 
+      X_data = res$X_data
+      X_pred = res$X_pred
+      X_mean = res$X_mean
+      X_std = res$X_std
+      pca = prcomp(X_data)
+      pov = pca$sdev^2/sum(pca$sdev^2)
+      pos = cumsum(pov)<0.95
+      if (length(pos)==0){
+        pos = 1
+      } else{
+        pos = max(pos)+1
+      }
+      X_data_reduced = pca$x[,1:pos]
+      X_pred_reduced = predict(pca, newdata = X_pred)[,1:pos]
+      names_X_pred_reduced = names(X_pred_reduced)
+      X_pred_reduced = data.frame(matrix(X_pred_reduced, nrow = 1))
+      colnames(X_pred_reduced) = names_X_pred_reduced
+        
+      for (ui in 1:u){
+        
+        y_data = dfaug_u[1:(t-1),ui]
+        res = normalize_y(y_data) 
+        y_data = res$y_data
+        y_std = res$y_std
+        y_mean = res$y_mean
+        
+        # when y_data is a constant, elastic net is slow, so use the mean for forecast
+        if (sd(y_data,na.rm=FALSE)<0.01){
+          dfaug_model[colnames(df)[ui]] = 'constant' #will only be 'constant' if no variation throughout training periods
+          dfaug_h[t,ui] = y_mean
+        } else{
+          dfaug_model[colnames(df)[ui]] = 'tbd'
+        
+          # Elastic Net CV
+          test = floor(nrow(X_data)/(Tin+1)) #number of splits is set as Tin
+          init = nrow(X_data)-test*Tin
+          myTimeControl = trainControl(method = "timeslice",
+                                        initialWindow = init,
+                                        horizon = test,
+                                        fixedWindow = FALSE)
+         # tuneLength.num = 100 #100 values for both alpha and lambda (use getModelInfo("glmnet") to see the detailed grids)
+          glmnet.mod = train(X_data,
+                              y_data,
+                              method = "glmnet",
+                              family = "gaussian",
+                              intercept = FALSE,
+                              trControl = myTimeControl,
+                              #tuneLength=tuneLength.num,
+                              metric='RMSE',
+                              allowParallel = TRUE)
+          dfaug_h_regularization[t, ui] = predict(glmnet.mod, newdata = X_pred)*y_std + y_mean
+          dfaug_regularization[[t]][[ui]] = glmnet.mod
+          
+          # OLS with X reduced by PCA
+          lm.mod = lm(y_data ~ ., data = data.frame(cbind(y_data, X_data_reduced)))
+          dfaug_h_dim_reduction[t, ui] = predict(lm.mod, newdata = X_pred_reduced)*y_std + y_mean
+          dfaug_dim_reduction[[t]][[ui]] = lm.mod
+        }
+      }
+    }
+    # Using cross-validation to choose fromm {ElasticNetCV,OLS+PCA} that performs best for each unknown variable
+    for (ui in 1:u){
+      if (dfaug_model[colnames(df)[ui]] != 'constant'){
+        fe_regularization = mean(abs(dfaug_h_regularization[(T_aug-Tin+1):T_aug,ui]-dfaug[(T_aug-Tin+1):T_aug,ui]))
+        fe_dim_reduction = mean(abs(dfaug_h_dim_reduction[(T_aug-Tin+1):T_aug,ui]-dfaug[(T_aug-Tin+1):T_aug,ui]))
+        if (fe_regularization < fe_dim_reduction){
+          dfaug_h[,ui] = dfaug_h_regularization[,ui]
+          dfaug_model[[colnames(df)[ui]]] = dfaug_regularization[[T_aug]][[ui]]
+        } else{
+          dfaug_h[,ui] = dfaug_h_dim_reduction[,ui]
+          dfaug_model[[colnames(df)[ui]]] = dfaug_dim_reduction[[T_aug]][[ui]]
+        }
+      }
+    }
+    
+    # store unused fitted models
+    dfaug_model[['regularization']] = dfaug_regularization
+    dfaug_model[['dim_reduction']] = dfaug_dim_reduction
+    
+    # forecast of T+2 to T+h, if h = 1 nothing will happen
+    if (h>1){
+      for (t in (T_aug+2):(T_aug+h)){
+        # add back deleted rows, drop lag variables and re-augment
+        df_h = dfaug_h[,colnames(df)]
+        df_h = rbind(df[1:lag,],df_h)
+        dfaug_h = augment_lag(df_h,lag) #more rows are deleted
+        for(ui in 1:u){
+          if (length(dfaug_model[[colnames(df)[ui]]])==1){
+            dfaug_h[t,ui] = dfaug_h[T_aug+1,ui]
+          } else{
+            model = dfaug_model[[colnames(df)[ui]]]
+            X_pred = (X_pred-X_mean)/X_std
+            if (class(model)=='lm'){
+              X_pred_reduced = predict(pca, newdata = X_pred)[,1:pos]
+              names_X_pred_reduced = names(X_pred_reduced)
+              X_pred_reduced = data.frame(matrix(X_pred_reduced, nrow = 1))
+              colnames(X_pred_reduced) = names_X_pred_reduced             
+              dfaug_h[t, ui] = predict(model,X_pred_reduced)*y_std + y_mean
+            } else{
+              dfaug_h[t, ui] = predict(model, X_pred)*y_std + y_mean
+            }
+            
+          }
+        }
+        
+      }
+    }
+    
+    df1 = df
+    df1[(nrow(df1)-h-Tin+1):nrow(df1),1:u] = dfaug_h[(nrow(dfaug_h)-h-Tin+1):nrow(dfaug_h),1:u]
+    df1 = df1[,colnames(df)]
+    return(list("df1" = df1, "dfaug_model" = dfaug_model))
+}
+
+step2 = function(df1, df, Tin, C_dict, d_dict){
+
+    #  Parameters
+    #  ----------
+    #  df: dataframe
+    #      (T+h) x m dataframe representing input data
+    #      the first m-k columns of T:T+h rows are nan, and the rest are not nan
+    #  df1: dataframe
+    #      (T+h) x m dataframe representing 1st stage forecast
+    #      no columns contain nan
+    #  Tin: int
+    #      the number of time periods in historical data used to estimate forecast-error
+    #  C_dict: dictionary
+    #      T+h length dictionary, each element of which is
+    #      (m-n) x m numpy matrix C in the constraint C x df = d
+    #      the order of columns must be the same of the columns of df
+    #      n is the number of free variables (net contents)
+    #  d_dict: dictionary
+    #      T+h length dictionary of numpy array, each element of which is
+    #      (m-n) x 1 column vector in the constraint C x df = d
+    # 
+    # Returns
+    #  -------
+    #  df2: dataframe
+    #      (T+h) x m dataframe
+    #      the last h rows are forecast that satisfies C x df=d
+
+           
+    #Preparation for step2 forecast
+    T = nrow(na.omit(df))
+    h = nrow(df)-T
+    df_u = df[,apply(df, 2, anyNA)]
+    u = ncol(df_u)
+    df_k = df[,!apply(df, 2, anyNA)]
+    duh = df1[,1:u]
+    eh  = data.matrix(duh[(T-Tin+1):T,] - df_u[(T-Tin+1):T,]) # in-sample one-step ahead forecast error
+    W = CovEst.2010OAS(eh)$S
+    
+    # reconcile rh by projecting it on constraint
+    df_u_2 = df_u
+
+    for (hi in 1:h){
+        Ci = C_dict[[T+hi]]
+        U = matrix(t(Ci)[1:u,],nrow = u)
+        d = d_dict[[T+hi]]
+        df_u_2[T+hi,] = t(t(duh[T+hi,]) - W %*% U %*% my_inv(t(U) %*% W %*% U) %*% 
+             (as.numeric(C) %*% t(cbind(duh[T+hi,],df_k[T+hi,])) -d))
+    }
+        
+    df2 = cbind(df_u_2,df_k)  
+    df2 = as.data.frame(df2,
+                         row.names = rownames(df),
+                         col.names = colnames(df))
+    df2[1:T,] = df[1:T,]
+    
+    return(df2)
+}
+   
+```
