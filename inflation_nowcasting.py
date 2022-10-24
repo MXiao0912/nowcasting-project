@@ -18,7 +18,7 @@ def setunknown(df_in, k, t):
     ind_u = ['M'+str(i) for i in range(k,13)]
     ind_u.extend(['A'])
     df = df_in.loc[:t,:].copy()
-    df.loc[df.index[-1],ind_u] = np.nan
+    df.loc[df.index[-1],ind_u] = np.nan 
     df_u = df.loc[:,df.isna().any()]
     df_k = df.loc[:,~df.isna().any()]    
     df_out = pd.concat([df_u, df_k], axis=1)
@@ -115,7 +115,7 @@ c = '138' # Netherlands
 
 # WEO
 weo_db = ecos.get_weo_databases()
-weo_db = weo_db[ (weo_db['year'] >= 2017) & (weo_db['month']!=1)]
+weo_db = weo_db[ (weo_db['year'] >= 2017) & (weo_db['month']!=1)]  # why filter out January reports?
 db_list = weo_db.index.tolist()
 frequency = 'A'
 v = 'PCPI' # PCPIHA_IX
@@ -132,7 +132,7 @@ for db in db_list:
     df['year'] = df.index.year
     weo = pd.concat([weo,df],axis=0,ignore_index=True)
 weo['inflation'] = weo.groupby('vintage')[c + v + '.A'].pct_change()*100
-weo_inflation = weo.loc[ (weo.year == weo.vintage.dt.year-1),:]
+weo_inflation = weo.loc[ (weo.year == weo.vintage.dt.year-1),:] # Is the next year record of the previous year value reliable as true value?
 
 # CPI
 v = 'PCPIHA_IX'
@@ -158,7 +158,7 @@ cpi = pd.concat([df_A, df_M], axis = 0)
 cpi = cpi.pivot(columns = 'type', values = 'value')
 
 cont = cpi.drop(columns='A')
-cont = (cont-cont.shift(1)).div(cpi.A.shift(1),axis=0)/12 * 100 # transform data to yoy contribution
+cont = (cont-cont.shift(1)).div(cpi.A.shift(1),axis=0)/12 * 100 # transform data to yoy contribution # how do we interpret this contribution? 
 cont['A'] = cpi.A.pct_change() * 100
 cont.loc[cont.index[-1],'A'] = np.nan # pct_change with nan gives 0
 cont = cont.dropna()
@@ -167,7 +167,7 @@ cont.plot()
 # check data consistency, weo = cpi?
 should_be_zero = cpi.filter(like='M').mean(axis=1) - cpi['A'] # cpi annual is the average of monthly
 cont.loc[cont.index>=2017,'A']
-weo.loc[ (weo.year == weo.vintage.dt.year-1) & (weo.vintage.dt.month == 4),:]
+weo.loc[ (weo.year == weo.vintage.dt.year-1) & (weo.vintage.dt.month == 4),:] # why use April weo vintage as the true value?
 
 #%% forecast
 lag = 2
